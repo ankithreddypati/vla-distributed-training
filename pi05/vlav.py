@@ -23,7 +23,7 @@ DATASET_PATH = f"hf://datasets/{DATASET_ID}@{REVISION}"
 
 CHECKPOINT_REPO  = "ankithreddy/pi05-so101-pickplace"
 RUN_NAME         = "pi05-so101-pickplace-finetune"
-RUN_STORAGE_PATH = "/tmp/ray_runs"
+RUN_STORAGE_PATH = "/tmp/ray_runs"   # container disk, not volume
 
 # ============================================================================
 # Connect to Ray
@@ -32,6 +32,16 @@ RUN_STORAGE_PATH = "/tmp/ray_runs"
 import ray
 
 ray.init(
+    # Point ALL Ray temp/spill files to container disk (/tmp), not /workspace.
+    # Your volume disk (/workspace) is only 20GB and was hitting 101%.
+    # Container disk is 50GB and still has ~21GB free.
+    _temp_dir="/tmp/ray_tmp",
+
+    # Give Ray's object store 20GB of your 93GB RAM.
+    # This prevents spilling to disk in the first place —
+    # processed batches stay in memory between CPU pipeline and GPU workers.
+    object_store_memory=20 * 1024 ** 3,
+
     runtime_env={
         "py_executable": "uv run",
         "working_dir": ".",
@@ -73,7 +83,9 @@ ds = (
     ray.data
     .read_datasource(source)
     .map(rename_columns, fn_args=(CAMERA_RENAME,))
-    .map_batches(transpose_images, batch_size=32, fn_args=(image_keys,))
+    # Reduced batch_size: 32 -> 8 so each batch object is smaller,
+    # less pressure on the object store between CPU and GPU workers.
+    .map_batches(transpose_images, batch_size=8, fn_args=(image_keys,))
 )
 
 log.info("pipeline ready — %d frames, cameras: %s", source.meta.total_frames, image_keys)
@@ -92,13 +104,9 @@ def train_loop_per_worker(config: dict):
 
     wandb = setup_wandb(config, project=RUN_NAME)
 
-    # Load full model (no freezing yet) and wrap in DDP
-    # Both ranks must see the same full model during DDP init
     policy = util.load_pi05_policy()
     policy = ray.train.torch.prepare_model(policy, parallel_strategy_kwargs={"find_unused_parameters": True})
 
-    # Freeze backbone AFTER DDP wrap — both ranks saw same params during init
-    # Only train the small action/time projection heads
     for name, module in policy.module.model.named_children():
         if name in {"action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out"}:
             for p in module.parameters():
@@ -203,11 +211,23 @@ run_config = ray.train.RunConfig(
     failure_config=ray.train.FailureConfig(max_failures=1),
 )
 
+# DataConfig caps how much the CPU pipeline runs ahead of GPU workers.
+# Without this, Ray Data eagerly preprocesses everything and floods the
+# object store — exactly what caused your 31.4GiB/13.9GiB overflow.
+data_config = ray.train.DataConfig(
+    execution_options=ray.data.ExecutionOptions(
+        resource_limits=ray.data.ExecutionResources(
+            object_store_memory=10 * 1024 ** 3  # cap pipeline at 10GB object store
+        )
+    )
+)
+
 trainer = ray.train.torch.TorchTrainer(
     train_loop_per_worker=train_loop_per_worker,
     train_loop_config=train_loop_config,
     scaling_config=scaling_config,
     run_config=run_config,
+    dataset_config=data_config,
     datasets={"train": ds},
 )
 
