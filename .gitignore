@@ -1,0 +1,28 @@
+# environment
+.env
+*.env
+
+# python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# jupyter
+.ipynb_checkpoints/
+
+# data & checkpoints
+data/
+data_old/
+outputs/
+/tmp/ray_runs/
+
+# ray
+/tmp/ray/
+
+# macos
+.DS_Store
+
+# uv
+uv.lock
