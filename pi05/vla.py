@@ -1,5 +1,6 @@
 import logging
 import os
+import tempfile
 
 import numpy as np
 import util
@@ -32,6 +33,8 @@ RUN_STORAGE_PATH = "/tmp/ray_runs"
 import ray
 
 ray.init(
+    _temp_dir="/tmp/ray_tmp",
+    object_store_memory=20 * 1024 ** 3,
     runtime_env={
         "py_executable": "uv run",
         "working_dir": ".",
@@ -65,7 +68,8 @@ def transpose_images(batch: dict, camera_keys: list[str]) -> dict:
 
 from lerobot_datasource import LeRobotDatasource, Partitioning
 
-source     = LeRobotDatasource(DATASET_PATH, partitioning=Partitioning.EPISODE)
+# source     = LeRobotDatasource(DATASET_PATH, partitioning=Partitioning.EPISODE)
+source = LeRobotDatasource(DATASET_PATH, partitioning=Partitioning.FILE_GROUP)
 stats      = util.extract_stats(source)
 image_keys = util.renamed_image_keys(source, CAMERA_RENAME)
 
@@ -73,7 +77,7 @@ ds = (
     ray.data
     .read_datasource(source)
     .map(rename_columns, fn_args=(CAMERA_RENAME,))
-    .map_batches(transpose_images, batch_size=32, fn_args=(image_keys,))
+    .map_batches(transpose_images, batch_size=8, fn_args=(image_keys,))
 )
 
 log.info("pipeline ready — %d frames, cameras: %s", source.meta.total_frames, image_keys)
@@ -92,20 +96,9 @@ def train_loop_per_worker(config: dict):
 
     wandb = setup_wandb(config, project=RUN_NAME)
 
-    # Load full model (no freezing yet) and wrap in DDP
-    # Both ranks must see the same full model during DDP init
+    # Backbone frozen BEFORE DDP wrap — critical for float16 + GradScaler
     policy = util.load_pi05_policy()
-    policy = ray.train.torch.prepare_model(policy, parallel_strategy_kwargs={"find_unused_parameters": True})
-
-    # Freeze backbone AFTER DDP wrap — both ranks saw same params during init
-    # Only train the small action/time projection heads
-    for name, module in policy.module.model.named_children():
-        if name in {"action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out"}:
-            for p in module.parameters():
-                p.requires_grad = True
-        else:
-            for p in module.parameters():
-                p.requires_grad = False
+    policy = ray.train.torch.prepare_model(policy)
 
     optimizer = torch.optim.AdamW(
         [p for p in policy.parameters() if p.requires_grad],
@@ -188,8 +181,8 @@ train_loop_config = {
     "stats":       stats,
     "total_rows":  source.meta.total_frames,
     "num_epochs":  2,
-    "batch_size":  2,
-    "grad_accum":  4,
+    "batch_size":  4,
+    "grad_accum":  2,
     "lr":          1e-4,
     "warmup_frac": 0.1,
     "max_len":     512,
@@ -203,11 +196,20 @@ run_config = ray.train.RunConfig(
     failure_config=ray.train.FailureConfig(max_failures=1),
 )
 
+data_config = ray.train.DataConfig(
+    execution_options=ray.data.ExecutionOptions(
+        resource_limits=ray.data.ExecutionResources(
+            object_store_memory=10 * 1024 ** 3
+        )
+    )
+)
+
 trainer = ray.train.torch.TorchTrainer(
     train_loop_per_worker=train_loop_per_worker,
     train_loop_config=train_loop_config,
     scaling_config=scaling_config,
     run_config=run_config,
+    dataset_config=data_config,
     datasets={"train": ds},
 )
 
@@ -219,14 +221,29 @@ log.info("Training complete: %s", result)
 # ============================================================================
 
 if result.checkpoint:
+    import ray.cloudpickle as pickle
     from huggingface_hub import HfApi
+    from lerobot.policies.pi05 import PI05Policy
 
     with result.checkpoint.as_directory() as ckpt_dir:
-        api = HfApi(token=HF_TOKEN)
-        api.create_repo(CHECKPOINT_REPO, repo_type="model", exist_ok=True)
-        api.upload_folder(
-            folder_path=ckpt_dir,
-            repo_id=CHECKPOINT_REPO,
-            repo_type="model",
-        )
-        log.info("checkpoint pushed to: %s", CHECKPOINT_REPO)
+        with open(os.path.join(ckpt_dir, "state.pkl"), "rb") as f:
+            state = pickle.load(f)
+
+    # Load on CPU in float32 for saving — float16 not supported on CPU
+    save_dir = tempfile.mkdtemp(prefix="pi05_hf_")
+    policy = PI05Policy.from_pretrained(
+        "lerobot/pi05_base",
+        device="cpu",
+        dtype=torch.float32,
+    )
+    policy.load_state_dict(state["model"])
+    policy.save_pretrained(save_dir)
+
+    api = HfApi(token=HF_TOKEN)
+    api.create_repo(CHECKPOINT_REPO, repo_type="model", exist_ok=True)
+    api.upload_folder(
+        folder_path=save_dir,
+        repo_id=CHECKPOINT_REPO,
+        repo_type="model",
+    )
+    log.info("checkpoint pushed to: %s", CHECKPOINT_REPO)
