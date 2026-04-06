@@ -259,8 +259,21 @@ class LeRobotDatasourceMetadata:
 
     @property
     def estimated_row_size_bytes(self) -> int:
-        """Capped at 128KB to prevent Ray from triggering SplitBlocks."""
-        return 128 * 1024
+        """Estimated in-memory size of one fully-decoded frame row (bytes)."""
+        features = self.info.get("features", {})
+        total = 0
+        for feat in features.values():
+            if feat.get("dtype") == "video":
+                shape = feat.get("shape")
+                if shape:
+                    total += int(np.prod(shape))
+            else:
+                shape = feat.get("shape", [1])
+                try:
+                    total += int(np.prod(shape)) * np.dtype(feat["dtype"]).itemsize
+                except (TypeError, KeyError):
+                    continue
+        return total
 
     @property
     def video_path_template(self) -> str:
