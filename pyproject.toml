@@ -5,27 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "accelerate<2",
     "av>=15.1.0",
-    "diffusers<0.36",
-    "einops<0.9",
     "huggingface-hub[cli,hf-transfer]==0.35.3",
-    "ipykernel>=7.2.0",
     "ipywidgets>=8.1.8",
     "lerobot==0.4.3",
-    "opencv-python-headless==4.11.0.86",
     "python-dotenv>=1.2.2",
     "ray[data,train]>=2.54.1",
     "sentencepiece>=0.2.1",
-    "torch>=2.7.1,<2.8",
-    "torchcodec<0.6",
-    "torchvision<0.23",
     "transformers",
-]
-
-[dependency-groups]
-dev = [
-    "ipykernel>=7.2.0",
+    "wandb>=0.24.2",
 ]
 
 [tool.uv.sources]

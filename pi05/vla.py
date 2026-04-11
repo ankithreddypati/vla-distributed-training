@@ -68,8 +68,7 @@ def transpose_images(batch: dict, camera_keys: list[str]) -> dict:
 
 from lerobot_datasource import LeRobotDatasource, Partitioning
 
-# source     = LeRobotDatasource(DATASET_PATH, partitioning=Partitioning.EPISODE)
-source = LeRobotDatasource(DATASET_PATH, partitioning=Partitioning.FILE_GROUP)
+source     = LeRobotDatasource(DATASET_PATH, partitioning=Partitioning.EPISODE)
 stats      = util.extract_stats(source)
 image_keys = util.renamed_image_keys(source, CAMERA_RENAME)
 
