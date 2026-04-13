@@ -1,6 +1,11 @@
 """
 Training Utilities for VLA Fine-Tuning
 =======================================
+
+Helper functions used by main.py. These are separated out to keep the main
+script focused on the Ray Data + Ray Train pipeline, while housing the
+model-specific plumbing (freezing layers, checkpointing, collation, etc.)
+in one place.
 """
 
 import os
@@ -13,12 +18,13 @@ from ray.data.iterator import NumpyBatchCollateFn
 
 
 # ============================================================================
-# PI0.5 Patches
+# PI0.5 Attention Mask Patch
 # ============================================================================
 
 def apply_pi05_attention_mask_patch():
     """Monkey-patch make_att_2d_masks to tolerate pad/attention mask length mismatches."""
     import lerobot.policies.pi05.modeling_pi05 as mp
+
     if getattr(mp, "_PI05_MASK_PATCH_APPLIED", False):
         return
     _orig = mp.make_att_2d_masks
@@ -38,34 +44,12 @@ def apply_pi05_attention_mask_patch():
     mp._PI05_MASK_PATCH_APPLIED = True
 
 
-def apply_pi05_loss_patch():
-    """Fix u_t/v_t shape mismatch in PI05Pytorch.forward.
-
-    v_t from action_out_proj has shape [batch, chunk_size, action_dim].
-    u_t (noised actions) comes in as [batch, action_dim] from the preprocessor.
-    MSE loss broadcasts incorrectly — this patch expands actions to
-    [batch, chunk_size, action_dim] before entering forward so shapes match.
-    """
-    import lerobot.policies.pi05.modeling_pi05 as mp
-    if getattr(mp, "_PI05_LOSS_PATCH_APPLIED", False):
-        return
-
-    _orig_forward = mp.PI05Pytorch.forward
-
-    def _patched_forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None):
-        if actions is not None and actions.dim() == 2:
-            actions = actions.unsqueeze(1).expand(-1, self.config.chunk_size, -1)
-        return _orig_forward(self, images, img_masks, tokens, masks, actions, noise, time)
-
-    mp.PI05Pytorch.forward = _patched_forward
-    mp._PI05_LOSS_PATCH_APPLIED = True
-
-
 # ============================================================================
 # Dataset Helpers
 # ============================================================================
 
 def extract_stats(source):
+    """Extract normalization stats (mean/std) from a LeRobot datasource."""
     raw = source.meta.stats
     stats = {}
     for key in ("action", "observation.state"):
@@ -75,6 +59,7 @@ def extract_stats(source):
 
 
 def renamed_image_keys(source, camera_rename):
+    """Get camera column names after applying the rename map."""
     return [camera_rename.get(k, k) for k in source.meta.video_keys]
 
 
@@ -83,26 +68,19 @@ def renamed_image_keys(source, camera_rename):
 # ============================================================================
 
 def load_pi05_policy(pretrained_path="lerobot/pi05_base"):
-    """Load PI0.5 in float16, freeze backbone BEFORE DDP wrap.
-
-    Freeze before DDP is critical — frozen params have requires_grad=False
-    so GradScaler never tries to unscale their float16 gradients. Only the
-    4 small trainable heads have gradients, all in float16, which is exactly
-    what GradScaler expects.
-    """
+    """Load PI0.5, apply the attention mask patch, and freeze the backbone."""
     from lerobot.policies.pi05 import PI05Policy
 
     apply_pi05_attention_mask_patch()
-    apply_pi05_loss_patch()
 
     policy = PI05Policy.from_pretrained(
-        pretrained_path,
-        device="cuda",
-        dtype=torch.float16,
-        train_expert_only=True,
+        pretrained_path, device="cuda", dtype=torch.float16, train_expert_only=True,
     )
 
-    # Freeze backbone, unfreeze only action/time heads — BEFORE DDP wrap
+    # Force ALL parameters to cuda — embed_tokens can stay on CPU after load
+    policy = policy.to(torch.device("cuda"))
+
+    # Freeze everything, then unfreeze the small trainable heads
     for p in policy.parameters():
         p.requires_grad = False
     for name, module in policy.model.named_children():
@@ -118,11 +96,15 @@ def load_pi05_policy(pretrained_path="lerobot/pi05_base"):
 # ============================================================================
 
 def load_checkpoint(checkpoint, policy, optimizer, scaler) -> tuple[int, int]:
+    """Restore model/optimizer/scaler state from a Ray Train checkpoint."""
     import ray.cloudpickle as pickle
+
     with checkpoint.as_directory() as d:
         with open(os.path.join(d, "state.pkl"), "rb") as f:
             state = pickle.load(f)
-    policy.module.load_state_dict(state["model"])
+
+    inner = policy.module if hasattr(policy, "module") else policy
+    inner.load_state_dict(state["model"])
     optimizer.load_state_dict(state["optim"])
     if "scaler" in state:
         scaler.load_state_dict(state["scaler"])
@@ -130,13 +112,21 @@ def load_checkpoint(checkpoint, policy, optimizer, scaler) -> tuple[int, int]:
 
 
 def make_checkpoint(policy, optimizer, scaler, epoch, step):
+    """Serialize model + optimizer + scaler state into a Ray Train Checkpoint."""
     import ray.cloudpickle as pickle
     import ray.train
+
+    inner = policy.module if hasattr(policy, "module") else policy
     ckpt_dir = tempfile.mkdtemp(prefix="pi05_ckpt_")
     with open(os.path.join(ckpt_dir, "state.pkl"), "wb") as f:
         pickle.dump(
-            {"model": policy.module.state_dict(), "optim": optimizer.state_dict(),
-             "scaler": scaler.state_dict(), "epoch": epoch, "step": step},
+            {
+                "model":  inner.state_dict(),
+                "optim":  optimizer.state_dict(),
+                "scaler": scaler.state_dict(),
+                "epoch":  epoch,
+                "step":   step,
+            },
             f,
         )
     return ray.train.Checkpoint.from_directory(ckpt_dir)
@@ -147,6 +137,7 @@ def make_checkpoint(policy, optimizer, scaler, epoch, step):
 # ============================================================================
 
 def truncate_batch(batch: dict, max_len: int) -> dict:
+    """Clip sequence and mask tensors to max_len tokens."""
     if not max_len:
         return batch
     for k in ("tokens", "input_ids", "masks", "attention_mask",
@@ -161,6 +152,12 @@ def truncate_batch(batch: dict, max_len: int) -> dict:
 # ============================================================================
 
 class NumpyToTorchCollate(NumpyBatchCollateFn):
+    """Convert a numpy batch dict into tensors on the target device.
+
+    Handles ArrowVariableShapedTensorArray (object dtype) by stacking first.
+    Keeps task column as a list of strings for language conditioning.
+    """
+
     def __init__(self, device: torch.device):
         self.device = device
 
@@ -169,6 +166,9 @@ class NumpyToTorchCollate(NumpyBatchCollateFn):
         result = {}
         for k, v in batch.items():
             arr = np.asarray(v)
+            if arr.dtype == object:
+                # ArrowVariableShapedTensorArray — stack into single array
+                arr = np.stack(arr.tolist())
             if np.issubdtype(arr.dtype, np.integer):
                 result[k] = torch.tensor(arr, dtype=torch.long, device=self.device)
             elif np.issubdtype(arr.dtype, np.bool_):
@@ -184,11 +184,17 @@ class NumpyToTorchCollate(NumpyBatchCollateFn):
 # ============================================================================
 
 def train_step(policy, batch, preprocessor, max_len, grad_accum, scaler):
-    """Forward + backward pass using float16 autocast + GradScaler."""
     batch = preprocessor(batch)
     batch = truncate_batch(batch, max_len)
     batch.pop("task", None)
     batch.pop("task_index", None)
+
+    # Preprocessor can create new tensors on CPU — move everything to GPU
+    device = next(policy.parameters()).device
+    batch = {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v
+        for k, v in batch.items()
+    }
 
     with torch.autocast("cuda", torch.float16):
         out = policy(batch)
@@ -199,6 +205,7 @@ def train_step(policy, batch, preprocessor, max_len, grad_accum, scaler):
 
 
 def optimizer_step(policy, optimizer, scaler, scheduler):
+    """Unscale gradients, clip, step the optimizer, and update the LR schedule."""
     scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_norm_(
         [p for p in policy.parameters() if p.requires_grad], max_norm=1.0,
@@ -210,7 +217,9 @@ def optimizer_step(policy, optimizer, scaler, scheduler):
 
 
 def build_lr_scheduler(optimizer, config, num_workers, last_step):
+    """Create a linear-warmup + cosine-decay LR scheduler."""
     import math
+
     batch_size  = int(config.get("batch_size", 1))
     grad_accum  = int(config.get("grad_accum", 1))
     num_epochs  = int(config.get("num_epochs", 1))
@@ -218,7 +227,7 @@ def build_lr_scheduler(optimizer, config, num_workers, last_step):
     warmup_frac = float(config.get("warmup_frac", 0.1))
 
     rows_per_worker = total_rows // num_workers
-    total_steps  = max(rows_per_worker // (batch_size * grad_accum), 1) * num_epochs
+    total_steps = max(rows_per_worker // (batch_size * grad_accum), 1) * num_epochs
     warmup_steps = int(total_steps * warmup_frac)
 
     def lr_lambda(s):

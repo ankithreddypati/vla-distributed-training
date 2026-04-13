@@ -415,6 +415,11 @@ class LeRobotReadTask(ReadTask):
                     ep_idx = ep_idx_col[row_idx].as_py()
                     row_ts = timestamp_col[row_idx].as_py()
 
+                    # Skip rows belonging to episodes outside this task's range
+                    if ep_idx not in ep_from_ts[meta.video_keys[0]]:
+                        seg_start = row_idx + 1
+                        continue
+
                     for k in meta.video_keys:
                         target_ts = ep_from_ts[k][ep_idx] + row_ts
                         if cur[k] is None:
