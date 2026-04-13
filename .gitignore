@@ -26,3 +26,14 @@ outputs/
 
 # uv
 uv.lock
+
+
+# infra
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfstate.lock.info
+.terraform.lock.hcl
+terraform.tfvars
+*.tfvars
+crash.log
