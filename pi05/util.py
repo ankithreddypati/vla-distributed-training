@@ -49,12 +49,18 @@ def apply_pi05_attention_mask_patch():
 # ============================================================================
 
 def extract_stats(source):
-    """Extract normalization stats (mean/std) from a LeRobot datasource."""
+    """Extract all normalization stats from a LeRobot datasource.
+
+    Passes through all available keys (mean, std, min, max, q01, q99, etc.)
+    so make_pre_post_processors has everything it needs regardless of which
+    normalization mode is configured.
+    """
     raw = source.meta.stats
     stats = {}
     for key in ("action", "observation.state"):
         if key in raw:
-            stats[key] = {"mean": raw[key]["mean"], "std": raw[key]["std"]}
+            # Pass all stat keys — don't filter to just mean/std
+            stats[key] = {k: v for k, v in raw[key].items()}
     return stats
 
 

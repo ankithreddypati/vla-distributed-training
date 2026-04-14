@@ -19,7 +19,7 @@ DO_SPACES_SECRET = os.environ["DO_SPACES_SECRET"]
 DATASET_PATH     = "s3://lerobot-datasets/so101_pickplace_tools_v3"
 DO_ENDPOINT      = "https://atl1.digitaloceanspaces.com"
 
-CHECKPOINT_REPO  = "ankithreddy/pi05-so101-finetune"
+CHECKPOINT_REPO  = "ankithreddy/pi05-so101-finetune-v5"
 RUN_NAME         = "pi05-so101-pickplace"
 RUN_STORAGE_PATH = os.path.abspath("./checkpoints")
 
@@ -65,7 +65,7 @@ log.info(f"ray resources: {ray.cluster_resources()}")
 
 import ray.data
 import util
-from lerobot_datasource import LeRobotDatasource, Partitioning
+from datasource import LeRobotDatasource, Partitioning
 
 
 def rename_columns(row: dict, rename: dict[str, str]) -> dict:
@@ -85,12 +85,14 @@ source     = LeRobotDatasource(DATASET_PATH, partitioning=Partitioning.FILE_GROU
 stats      = util.extract_stats(source)
 image_keys = util.renamed_image_keys(source, CAMERA_RENAME)
 
-ds = (
+dataset = (
     ray.data
     .read_datasource(source)
     .map(rename_columns, fn_args=(CAMERA_RENAME,))
     .map_batches(transpose_images, batch_size=32, fn_args=(image_keys,))
 )
+
+
 
 log.info(f"pipeline ready — {source.meta.total_frames} frames, cameras: {image_keys}")
 
@@ -102,6 +104,8 @@ def train_loop_per_worker(config: dict):
     import wandb as wandb_lib
     from ray.air.integrations.wandb import setup_wandb
     from lerobot.policies.factory import make_pre_post_processors
+
+    is_rank_zero = ray.train.get_context().get_world_rank() == 0
 
     wandb_lib.finish()
     wandb = setup_wandb(
@@ -125,15 +129,14 @@ def train_loop_per_worker(config: dict):
     else:
         start_epoch, step = 0, 0
 
-    inner_policy = policy.module if hasattr(policy, "module") else policy
-    inner_policy.config.normalization_mapping = {
+    policy.module.config.normalization_mapping = {
         "ACTION": "MEAN_STD",
         "STATE":  "MEAN_STD",
         "VISUAL": "IDENTITY",
     }
 
     preprocessor, _ = make_pre_post_processors(
-        inner_policy.config,
+        policy.module.config,
         pretrained_path="lerobot/pi05_base",
         dataset_stats=config["stats"],
     )
@@ -167,16 +170,17 @@ def train_loop_per_worker(config: dict):
 
             if step % 10 == 0:
                 log.info(f"epoch={epoch} step={step} loss={loss_val:.4f} lr={scheduler.get_last_lr()[0]:.2e}")
-                wandb.log({"loss": loss_val, "lr": scheduler.get_last_lr()[0], "step": step})
+                if is_rank_zero:
+                    wandb.log({"loss": loss_val, "lr": scheduler.get_last_lr()[0], "step": step})
 
         if accum_count > 0:
             util.optimizer_step(policy, optimizer, scaler, scheduler)
 
         avg_loss = epoch_loss / max(epoch_count, 1)
         metrics  = {"epoch": epoch, "step": step, "loss": avg_loss, "lr": scheduler.get_last_lr()[0]}
-        wandb.log({"epoch_loss": avg_loss, "epoch": epoch})
 
-        if ray.train.get_context().get_world_rank() == 0:
+        if is_rank_zero:
+            wandb.log({"epoch_loss": avg_loss, "epoch": epoch})
             checkpoint = util.make_checkpoint(policy, optimizer, scaler, epoch, step)
             ray.train.report(metrics, checkpoint=checkpoint)
         else:
@@ -199,7 +203,7 @@ train_loop_config = {
 }
 
 scaling_config = ray.train.ScalingConfig(
-    num_workers=1,
+    num_workers=2,
     use_gpu=True,
 )
 
@@ -214,8 +218,9 @@ trainer = ray.train.torch.TorchTrainer(
     train_loop_config=train_loop_config,
     scaling_config=scaling_config,
     run_config=run_config,
-    datasets={"train": ds},
+    datasets={"train": dataset},
 )
+
 
 result = trainer.fit()
 log.info(f"training complete: {result}")
@@ -224,14 +229,51 @@ log.info(f"training complete: {result}")
 
 if result.checkpoint:
     import ray.cloudpickle as pickle
+    from huggingface_hub import HfApi
     from lerobot.policies.pi05 import PI05Policy
+    from lerobot.policies.factory import make_pre_post_processors
 
     with result.checkpoint.as_directory() as ckpt_dir:
         with open(os.path.join(ckpt_dir, "state.pkl"), "rb") as f:
             state = pickle.load(f)
 
-    # Load the trained weights into the policy and push directly
     policy = PI05Policy.from_pretrained("lerobot/pi05_base")
-    policy.load_state_dict(state["model"], strict=False)
-    policy.push_to_hub(CHECKPOINT_REPO, token=HF_TOKEN)
-    log.info(f"checkpoint pushed to: https://huggingface.co/{CHECKPOINT_REPO}")
+
+    missing, unexpected = policy.load_state_dict(state["model"], strict=False)
+    if missing:
+        log.warning(f"Missing keys: {missing}")
+    if unexpected:
+        log.warning(f"Unexpected keys: {unexpected}")
+
+    policy.config.normalization_mapping = {
+        "ACTION": "MEAN_STD",
+        "STATE":  "MEAN_STD",
+        "VISUAL": "IDENTITY",
+    }
+
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy.config,
+        pretrained_path="lerobot/pi05_base",
+        dataset_stats=stats,
+    )
+
+    save_dir = "./final_checkpoint_v5"
+    os.makedirs(save_dir, exist_ok=True)
+
+    policy.save_pretrained(save_dir)
+    preprocessor.save_pretrained(save_dir)
+    postprocessor.save_pretrained(save_dir)
+
+    saved_files = os.listdir(save_dir)
+    log.info(f"Files in checkpoint dir: {saved_files}")
+
+    required = {"config.json", "policy_preprocessor.json", "policy_postprocessor.json"}
+    missing_files = required - set(saved_files)
+    if missing_files:
+        raise RuntimeError(f"Missing required files before HF push: {missing_files}")
+
+    api = HfApi()
+    api.create_repo(repo_id=CHECKPOINT_REPO, repo_type="model", token=HF_TOKEN, exist_ok=True)
+    api.upload_folder(folder_path=save_dir, repo_id=CHECKPOINT_REPO, repo_type="model", token=HF_TOKEN)
+    log.info(f"pushed to: https://huggingface.co/{CHECKPOINT_REPO}")
+    log.info(f"uploaded files: {saved_files}")

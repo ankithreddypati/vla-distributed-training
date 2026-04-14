@@ -11,6 +11,7 @@ dependencies = [
     "lerobot==0.4.3",
     "python-dotenv>=1.2.2",
     "ray[data,train]>=2.54.1",
+    "s3fs>=2025.9.0",
     "sentencepiece>=0.2.1",
     "transformers",
     "wandb>=0.24.2",
