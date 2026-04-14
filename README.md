@@ -28,6 +28,8 @@ Each GPU gets a copy of the data batch or a shard of the model, runs the forward
 | `num_workers` | 4 | 4 |
 
 I used 2xH200 sxm with batch size = 16 , gradaccum=1 , num_workers = 2 
+> Ray spills to disk and fills the object store quickly if CPUs produce data faster than GPUs can consume it
+
 ![W&B loss curve](assets/wandb_run.png)
 
 **Checkpoint:** [ankithreddy/pi05-so101-finetune-v2](https://huggingface.co/ankithreddy/pi05-so101-finetune-v5)
